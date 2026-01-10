@@ -3,6 +3,7 @@ import tarfile
 from io import BytesIO
 from threading import Thread
 from typing import Iterator, List
+from multiprocessing import Pipe
 
 from django.apps import apps
 from django.db.models import FileField
@@ -11,7 +12,7 @@ from django.http import HttpRequest, StreamingHttpResponse
 logger = logging.getLogger(__name__)
 
 
-def _streaming_content(models: List[str]) -> Iterator[bytes]:
+def _dump(models: List[str], out) -> None:
     buffer = BytesIO()
     with tarfile.open("media.tar.gz", "w|gz", fileobj=buffer) as tar:
         for Model in apps.get_models():
@@ -27,31 +28,36 @@ def _streaming_content(models: List[str]) -> Iterator[bytes]:
             ]
             if not fields:
                 continue
-
-            def _dump():
-                for obj in Model.objects.iterator():
-                    for field in fields:
-                        value = getattr(obj, field)
-                        if value:
-                            try:
-                                with value.open() as f:
-                                    tar.addfile(
-                                        tar.gettarinfo(value.name, value.name, f),
-                                        f,
-                                    )
-                            except IOError:
-                                logger.exception(
-                                    f"Failed to read file stored in {field} of {obj}."
+            for obj in Model.objects.only(*fields).iterator():
+                for field in fields:
+                    value = getattr(obj, field)
+                    if value:
+                        try:
+                            with value.open() as f:
+                                tar.addfile(
+                                    tar.gettarinfo(value.name, value.name, f),
+                                    f,
                                 )
+                        except IOError:
+                            logger.exception(f"Failed to read {value.name}.")
+                out.send_bytes(buffer.getvalue())
+                buffer.seek(0)
+                buffer.truncate()
+    out.send_bytes(buffer.getvalue())
+    out.close()
 
-            # workaround for https://code.djangoproject.com/ticket/32798
-            t = Thread(target=_dump)
-            t.start()
-            t.join()
-        yield buffer.getvalue()
-        buffer.seek(0)
-        buffer.truncate()
-    yield buffer.getvalue()
+
+def _streaming_content(models: List[str]) -> Iterator[bytes]:
+    ours, theirs = Pipe()
+    # workaround for https://code.djangoproject.com/ticket/32798
+    t = Thread(target=_dump, args=(models, theirs))
+    t.start()
+    while True:
+        try:
+            yield ours.recv_bytes()
+        except EOFError:
+            break
+    t.join()
 
 
 def dumpmedia(request: HttpRequest) -> StreamingHttpResponse:
