@@ -12,9 +12,13 @@ from django.http import HttpRequest, StreamingHttpResponse
 logger = logging.getLogger(__name__)
 
 
-def _dump(models: List[str], out) -> None:
+def _dump(models: List[str], out, compress) -> None:
     buffer = BytesIO()
-    with tarfile.open("media.tar.gz", "w|gz", fileobj=buffer) as tar:
+    with tarfile.open(
+        "media",
+        "w|gz" if compress else "w",
+        fileobj=buffer,
+    ) as tar:
         for Model in apps.get_models():
             if models and Model._meta.verbose_name not in models:
                 continue
@@ -47,10 +51,10 @@ def _dump(models: List[str], out) -> None:
     out.close()
 
 
-def _streaming_content(models: List[str]) -> Iterator[bytes]:
+def _streaming_content(models: List[str], compress: bool) -> Iterator[bytes]:
     ours, theirs = Pipe()
     # workaround for https://code.djangoproject.com/ticket/32798
-    t = Thread(target=_dump, args=(models, theirs))
+    t = Thread(target=_dump, args=(models, theirs, compress))
     t.start()
     while True:
         try:
@@ -61,8 +65,13 @@ def _streaming_content(models: List[str]) -> Iterator[bytes]:
 
 
 def dumpmedia(request: HttpRequest) -> StreamingHttpResponse:
+    compress = "nocompress" not in request.GET
     return StreamingHttpResponse(
-        _streaming_content(request.GET.getlist("model")),
+        _streaming_content(request.GET.getlist("model"), compress),
         content_type="application/x-tar",
-        headers={"Content-Disposition": 'attachment; filename="media.tar.gz"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="media.tar{}"'.format(
+                ".gz" if compress else ""
+            )
+        },
     )
